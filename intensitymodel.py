@@ -2,172 +2,7 @@ import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
-import scipy.integrate as integrate
-from math import ceil
-from tensorflow.keras.preprocessing.sequence import pad_sequences
-import matplotlib.pyplot as plt
 
-# Function that creates a tf.data.Dataset for processing data ---------------------------
-
-def preprocess(raw):
-    """
-    Preprocessing of a single event sample.
-
-    Arguments:
-        raw: a list with the form (censoring time, event sequence type 1,
-        ..., sequence type K). The censoring time is a float32 and the
-        event sequences are 1 dim np array of increasing times.
-        First sequence list element is the event of interest.
-
-    Returns:
-        dat: np array of shape (time_steps, 2) where first column is event
-        time and second column is event type. First row is the censoring time.
-    """
-
-    # Pulling out censoring time and event list
-    C = raw[0]
-    X = raw[1:][0]
-
-    # Helper array
-    tmp = np.zeros((1, 2), dtype=np.float32)
-
-    # Restructure event list data to array with event marks
-    for i in range(len(X)):
-        tmp = np.vstack(
-            (tmp,
-             np.vstack((X[i], np.repeat(i+1, len(X[i])))).transpose())
-            )
-
-    # Sorting according to event time
-    idx = np.argsort(tmp[1:, :][:, 0])
-    tmp = tmp[1:, ][idx, :]
-
-    # Adding the censoring time as first element
-    dat = np.vstack((np.array([[C, np.NAN]]), tmp)).astype('float32')
-
-    return dat
-
-
-def nan_padding(x, max_length):
-    padding = np.repeat([np.NAN, np.NAN], max_length - x.shape[0])
-    padding = padding.reshape(-1, 2)
-    padding_seq = np.vstack((x, padding)).astype('float32')
-
-    return padding_seq
-
-
-def create_dataset(raw_data):
-    tmp = list(map(preprocess, raw_data))
-    max_length = max(list(map(np.shape, tmp)))[0]
-    tmp = list(map(lambda x: nan_padding(x, max_length), tmp))
-    dataset = tf.data.Dataset.from_tensor_slices(tf.constant(tmp))
-
-    return dataset
-
-
-# Custom classes of layers and models ---------------------------------------------------
-
-class RawSequence(keras.layers.Layer):
-    """
-    Custom layer giving
-
-    (0, X_1, ..., X_M, t)
-
-    where X_M is the largest event time smaller than t
-    """
-
-    def call(self, inputs):
-        # Extracting the event times
-        event_time = inputs[:, 0]
-        
-        # Removing the NAN-padding
-        event_time = tf.boolean_mask(
-            event_time, 
-            tf.math.logical_not(tf.math.is_nan(event_time))
-            )
-
-        # Extracting the time point
-        t = tf.expand_dims(event_time[-1], -1)
-
-        # Looking at events prior to t
-        prior_event = event_time[event_time < t]
-
-        # Creating the raw sequence plus time point
-        raw_event = tf.concat(values=[prior_event, t], axis=0)
-
-        # Reshaping into something recurrent layers like
-        output = tf.reshape(raw_event, shape=(1, -1, 1))
-
-        return output
-
-
-class LaggedSequence(keras.layers.Layer):
-    """
-    Custom layer giving
-
-    (t - 0, t - X_1, ..., t - X_M)
-
-    where X_M is the largest event time smaller than t
-    """
-    def call(self, inputs):
-        # Extracting the event times
-        event_time = inputs[:, 0]
-        
-        # Removing the NAN-padding
-        event_time = tf.boolean_mask(
-            event_time, 
-            tf.math.logical_not(tf.math.is_nan(event_time))
-            )
-
-        # Extracting the time point
-        t = event_time[-1]
-
-        # Looking at events prior to t
-        prior_event = event_time[event_time < t]
-
-        # Adding an artificial 0 (trial start)
-        prior_event = tf.concat(
-            [tf.zeros(1), prior_event], axis=0
-        )
-
-        # Creating lags
-        lagged_time = t - prior_event
-
-        # Reshaping into something recurrent layers like
-        output = tf.reshape(lagged_time, shape=(1, -1, 1))
-
-        return output
-
-
-class EmbeddingWithNAN(keras.layers.Embedding):
-    def call(self, inputs):
-        # Extracting event time and type
-        event_time = inputs[:, 0]
-        event_type = inputs[:, 1]
-
-        # Removing the NAN-padding
-        idx = tf.math.logical_not(tf.math.is_nan(event_time))
-        event_time = tf.boolean_mask(event_time, idx)
-        event_type = tf.boolean_mask(event_type, idx)
-
-        # Extracting the event intensity time point
-        t = event_time[-1]
-
-        # Looking at prior event types
-        prior_event_type = event_type[event_time < t]
-        
-        # Adding the zero event
-        prior_event_type = tf.concat(
-            [tf.zeros(1, dtype=tf.float32), prior_event_type], axis=0
-        )
-        
-        embedded_event = super(EmbeddingWithNAN, self).call(
-            prior_event_type
-            )
-
-        output = tf.expand_dims(embedded_event, axis=0)
-
-        return output
 
 
 class IntensityRNN(keras.Model):
@@ -340,17 +175,19 @@ class IntensityRNN(keras.Model):
 
     def compile(self, optimizer='rmsprop', loss=None, metrics=None,
                 loss_weights=None, weighted_metrics=None,
-                run_eagerly=None, L=50, d=1, **kwargs):
+                run_eagerly=None, L=50, a=1, **kwargs):
 
         """
-        Compiling the model as usual, but allowing for the additional
-        argument L, which is used during training
+        Compiling the model as usually, but specifying the parameter 
+        L, which determines the approximation accuracy of the integral 
+        part of the negative log-likelihood function, and a, which is 
+        the index of the intensity process of interest.
         """
 
         super().compile(optimizer, loss, metrics, loss_weights,
                         weighted_metrics, run_eagerly, **kwargs)
         self.L = L
-        self.d = d
+        self.a = a
 
 
     def train_step(self, data):
@@ -531,7 +368,7 @@ class IntensityRNN(keras.Model):
         # for the @tf.function graph compilation
         N = seq.shape[0]
         tmp1 = seq[:, 0] < C
-        tmp2 = seq[:, 1] == self.d
+        tmp2 = seq[:, 1] == self.a
         tmp3 = tf.math.logical_and(tmp1, tmp2)
         Delta = tf.where(tmp3, tf.ones(N), tf.zeros(N))
 
@@ -551,33 +388,75 @@ class IntensityRNN(keras.Model):
         return comp
 
 
-if __name__ == '__main__':
+
+def main():
+    from datapreprocessing import create_dataset, sim_example_data
+    from preprocessinglayers import LaggedSequence, EmbeddingWithNAN
+
+    N = 200
+    N_NODES = 10
+
+    data = sim_example_data(N=N, n_nodes=N_NODES)
+    dataset = create_dataset(data, marks = [1, 3, 4, 7])
 
     input = layers.Input(shape=(None, 2))
     x1 = LaggedSequence()(input)
-    x2 = EmbeddingWithNAN(input_dim=1+1, output_dim=3)(input)
+    x2 = EmbeddingWithNAN(input_dim = 1 + N_NODES, output_dim = 10)(input)
     x = tf.concat([x1, x2], axis=-1)
     x = layers.LSTM(10)(x)
+    x = layers.Dense(10, activation='tanh')(x)
     output = layers.Dense(1, activation='softplus')(x)
     model = IntensityRNN(inputs=input, outputs=output)
-    model.compile(optimizer='adam', d = 1)
+    model.compile(optimizer='adam', a = 3)
+    model.fit(x=dataset.batch(25), epochs=5)
     
-    scale = 1
-    N = 100
-    raw_data = []
-    for i in range(N):
-        T = np.random.randint(low=3, high=10, size=1)
-        seq = np.random.exponential(scale, T).cumsum()
-        C = 0.9 * max(seq)
-        raw_data.append([C, [seq]])
 
-    TRAIN_SIZE = 0.8
-    data_gen = create_dataset(raw_data)
-    data_gen_train = data_gen.take(int(TRAIN_SIZE * N))
-    data_gen_valid = data_gen.skip(int(TRAIN_SIZE * N))
-    opt = keras.optimizers.Adam(lr=0.002, decay=0.0005)
-    model.compile(optimizer=opt)
-    model.fit(x = data_gen_train.batch(10), epochs=2)
+
+if __name__ == '__main__':
+    main()
+
+    # from datapreprocessing import create_dataset1, create_dataset, sim_example_data
+    # from preprocessinglayers import LaggedSequence, EmbeddingWithNAN
+
+    # input = layers.Input(shape=(None, 2))
+    # x1 = LaggedSequence()(input)
+    # x2 = EmbeddingWithNAN(input_dim=1+1, output_dim=3)(input)
+    # x = tf.concat([x1, x2], axis=-1)
+    # x = layers.LSTM(10)(x)
+    # output = layers.Dense(1, activation='softplus')(x)
+    # model = IntensityRNN(inputs=input, outputs=output)
+    # model.compile(optimizer='adam', d = 1)
+    
+    # data = sim_example_data(N=50, n_nodes=4)
+    # dataset = create_dataset1(data)
+
+    # print(next(dataset.batch(1).as_numpy_iterator()))
+
+    # opt = keras.optimizers.Adam(lr=0.002, decay=0.0005)
+    # model.compile(optimizer=opt)
+
+    # model.fit(x = dataset.batch(10), epochs=1)
+
+    # scale = 1
+    # N = 100
+    # raw_data = []
+    # for i in range(N):
+    #     T = np.random.randint(low=3, high=10, size=1)
+    #     seq = np.random.exponential(scale, T).cumsum()
+    #     C = 0.9 * max(seq)
+    #     raw_data.append([C, [seq]])
+
+    # TRAIN_SIZE = 0.8
+    # data_gen = create_dataset(raw_data)
+
+    # print(next(data_gen.batch(1).as_numpy_iterator()))
+
+
+    # data_gen_train = data_gen.take(int(TRAIN_SIZE * N))
+    # data_gen_valid = data_gen.skip(int(TRAIN_SIZE * N))
+    # opt = keras.optimizers.Adam(lr=0.002, decay=0.0005)
+    # model.compile(optimizer=opt)
+    #model.fit(x = data_gen_train.batch(10), epochs=2)
 
 
     if False:
@@ -652,6 +531,7 @@ if __name__ == '__main__':
                 epochs=10)
 
         # Intensity plots -------------------------------------------------------------------
+        import matplotlib.pyplot as plt
 
         dat = next(data_gen_valid.batch(1).as_numpy_iterator())[0]
         C = dat[0, 0]

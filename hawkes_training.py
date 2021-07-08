@@ -28,9 +28,9 @@ for i in range(N):
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
-from intensitymodel import IntensityRNN, LaggedSequence, create_dataset
+from intensitymodel import IntensityRNN, LaggedSequence
+from datapreprocessing import create_dataset
 import matplotlib.pyplot as plt
-
 data = create_dataset(raw_data)
 
 def make_model():
@@ -45,7 +45,7 @@ def make_model():
     return model
 
 model = make_model()
-opt = keras.optimizers.Adam(lr=0.002, decay=0.0005)
+opt = keras.optimizers.Adam(learning_rate=0.002, decay=0.0005)
 model.compile(optimizer=opt, L=50, d=1)
 model.fit(x=data.batch(20), epochs = 10)
 
